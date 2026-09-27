@@ -949,18 +949,20 @@ class BondMeterMixin:
                 GLib.source_remove(source_id)
             except Exception:
                 pass
-        if self._bond_state_dirty or self._bond_unsaved_xp > 0:
-            self._persist_bond_state()
-        overlay = self._bond_progress_overlay
-        self._bond_progress_overlay = None
-        if overlay is not None:
-            # Clear our reference before destroy: destroy may synchronously
-            # report a finished card, and that callback must not enqueue the
-            # next reward against a surface that is being torn down.
-            overlay.destroy()
-        if self.state.presentation in (
-            PresentationState.LEVEL_UP,
-            PresentationState.EMOTE_UNLOCK,
-        ):
-            self.state.transition_presentation(PresentationState.NORMAL)
-        super().shutdown_presence()
+        try:
+            if self._bond_state_dirty or self._bond_unsaved_xp > 0:
+                self._persist_bond_state()
+        finally:
+            overlay = self._bond_progress_overlay
+            self._bond_progress_overlay = None
+            if overlay is not None:
+                # Clear our reference before destroy: destroy may synchronously
+                # report a finished card, and that callback must not enqueue the
+                # next reward against a surface that is being torn down.
+                overlay.destroy()
+            if self.state.presentation in (
+                PresentationState.LEVEL_UP,
+                PresentationState.EMOTE_UNLOCK,
+            ):
+                self.state.transition_presentation(PresentationState.NORMAL)
+            super().shutdown_presence()

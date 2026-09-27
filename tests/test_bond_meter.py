@@ -762,6 +762,24 @@ def test_bond_shutdown_continues_cleanup_when_save_fails() -> None:
     assert harness.shutdown_chain_calls == 1
 
 
+def test_bond_shutdown_cleans_up_before_unexpected_save_error_propagates() -> None:
+    harness = object.__new__(_BondShutdownHarness)
+    harness.__dict__.update(_runtime_harness(BondState(level=1, xp=120)).__dict__)
+    harness.shutdown_chain_calls = 0
+    harness._bond_state_dirty = True
+    harness._config.save_bond_state.side_effect = RuntimeError("unexpected")
+    harness.state.presentation = PresentationState.LEVEL_UP
+    overlay = harness._bond_progress_overlay
+
+    with pytest.raises(RuntimeError, match="unexpected"):
+        harness.shutdown_presence()
+
+    overlay.destroy.assert_called_once_with()
+    assert harness._bond_progress_overlay is None
+    assert harness.state.presentation is PresentationState.NORMAL
+    assert harness.shutdown_chain_calls == 1
+
+
 def test_level_up_presentation_runs_after_failed_save_and_retry_does_not_replay(
     tmp_path,
 ) -> None:

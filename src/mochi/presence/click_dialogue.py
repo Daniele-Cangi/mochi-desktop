@@ -23,6 +23,7 @@ from .music_dance import MusicDanceMixin
 from .nameplate_controls import NameplateMixin
 from .phrases import bond_dialogue_lines
 from .terminal_cowork import TerminalCoworkMixin
+from .update_controls import UpdateControlsMixin
 
 
 class ClickDialogueMixin:
@@ -179,12 +180,13 @@ class ClickDialogueMixin:
 class PresenceBuddy(
     ClickDialogueMixin,
     IdleLookMixin,
+    UpdateControlsMixin,
     QuickStartMixin,
     FocusSessionMixin,
     FedoraModeMixin,
     TerminalCoworkMixin,
-    MusicDanceMixin,
     EdgeRoamMixin,
+    MusicDanceMixin,
     EmoteCatalogueMixin,
     BondMeterMixin,
     FeedMochiMixin,
@@ -197,12 +199,13 @@ class PresenceBuddy(
 class PresenceX11Buddy(
     ClickDialogueMixin,
     IdleLookMixin,
+    UpdateControlsMixin,
     QuickStartMixin,
     FocusSessionMixin,
     FedoraModeMixin,
     TerminalCoworkMixin,
-    MusicDanceMixin,
     EdgeRoamMixin,
+    MusicDanceMixin,
     EmoteCatalogueMixin,
     BondMeterMixin,
     FeedMochiMixin,

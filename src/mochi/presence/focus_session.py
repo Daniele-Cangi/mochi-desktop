@@ -12,7 +12,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
-from mochi.focus import FocusPhase, FocusPlan, FocusSession
+from mochi.focus import FocusAdvance, FocusPhase, FocusPlan, FocusSession
 from mochi.menu_window import _window_coordinate_scale, menu_position_for_anchor
 from mochi.sound import FocusAmbienceManager
 from mochi.sprites import ANIMATIONS
@@ -30,6 +30,86 @@ FOCUS_BREAK_LINE = "break time 🌱"
 FOCUS_RESUME_LINE = "back to it. i'm with you 🌱"
 FOCUS_COMPLETE_LINE = "nice work. we did it 🌱"
 FOCUS_CANCEL_LINE = "stopped. no worries 🌱"
+
+
+def _focus_window_position_for_anchor(
+    anchor_x: int,
+    anchor_y: int,
+    owner_top_y: int,
+    owner_height: int,
+    window_width: int,
+    window_height: int,
+    geometries: list,
+    *,
+    gap: int = 16,
+    padding: int = 12,
+    coordinate_scale: float = 1.0,
+    anchor_width: int = 0,
+) -> tuple[int, int]:
+    """Place the large Focus window near Mochi without pinning it to screen bottom.
+
+    Horizontal placement deliberately reuses the proven menu helper. Vertical
+    placement is focus-specific: stay centered beside Mochi when that fits,
+    otherwise prefer a full-window placement above him, then below him, and
+    clamp only as a last resort.
+    """
+    scale = coordinate_scale if coordinate_scale > 0 else 1.0
+    x, _ = menu_position_for_anchor(
+        anchor_x,
+        anchor_y,
+        window_width,
+        window_height,
+        geometries,
+        gap=gap,
+        padding=padding,
+        coordinate_scale=scale,
+        anchor_width=anchor_width,
+    )
+
+    device_window_height = max(1, round(window_height * scale))
+    device_owner_height = max(1, round(owner_height * scale))
+    device_gap = round(gap * scale)
+
+    if not geometries:
+        return x, round(anchor_y - device_window_height / 2)
+
+    application_anchor_x = anchor_x / scale
+    application_anchor_y = anchor_y / scale
+
+    def distance_to_geometry(geometry) -> float:
+        nearest_x = max(
+            geometry.x,
+            min(application_anchor_x, geometry.x + geometry.width),
+        )
+        nearest_y = max(
+            geometry.y,
+            min(application_anchor_y, geometry.y + geometry.height),
+        )
+        return (
+            (application_anchor_x - nearest_x) ** 2
+            + (application_anchor_y - nearest_y) ** 2
+        )
+
+    monitor = min(geometries, key=distance_to_geometry)
+    top = round((monitor.y + padding) * scale)
+    bottom = round((monitor.y + monitor.height - padding) * scale)
+
+    owner_bottom_y = owner_top_y + device_owner_height
+    beside_y = round(anchor_y - device_window_height / 2)
+    above_y = owner_top_y - device_gap - device_window_height
+    below_y = owner_bottom_y + device_gap
+
+    if top <= beside_y and beside_y + device_window_height <= bottom:
+        y = beside_y
+    elif above_y >= top:
+        y = above_y
+    elif below_y + device_window_height <= bottom:
+        y = below_y
+    else:
+        max_y = max(top, bottom - device_window_height)
+        y = max(top, min(beside_y, max_y))
+
+    return x, y
 
 
 FOCUS_CSS = """
@@ -117,10 +197,15 @@ class FocusWindow:
         self._owner = owner
         self._position_serial = 0
 
-        self.window = Gtk.Window()
+        application = owner.get_application()
+        if application is not None:
+            self.window = Gtk.ApplicationWindow(application=application)
+        else:
+            # Keep isolated tests/embedders usable while avoiding a transient
+            # relationship with Mochi's always-on-top buddy window. A Focus
+            # session is a long-lived app surface, not a dialog owned by Mochi.
+            self.window = Gtk.Window()
         self.window.set_title("Focus with Mochi 🌱")
-        self.window.set_transient_for(owner)
-        self.window.set_destroy_with_parent(True)
         self.window.set_modal(False)
         self.window.set_hide_on_close(True)
         self.window.set_resizable(False)
@@ -428,9 +513,11 @@ class FocusWindow:
             monitor_list.get_item(index).get_geometry()
             for index in range(monitor_list.get_n_items())
         ]
-        x, y = menu_position_for_anchor(
+        x, y = _focus_window_position_for_anchor(
             anchor_x,
             anchor_y,
+            owner_y,
+            owner_height,
             width,
             height,
             geometries,
@@ -542,6 +629,7 @@ class FocusSessionMixin:
         self._focus_setup_visible = False
         self._focus_context_menu_visible = False
         self._focus_setup_pending = False
+        self._focus_idle_paused = False
         super().__init__(*args, **kwargs)
 
     def _build_context_menu(self):
@@ -621,13 +709,13 @@ class FocusSessionMixin:
             self._stop_focus_thinking_visual()
 
     def _start_focus_session(self, plan: FocusPlan) -> None:
-        
         if self._focus_session is not None and self._focus_session.active:
             return
-        
+
         self._focus_setup_visible = False
         self._focus_plan = plan
         self._focus_session = FocusSession(plan)
+        self._focus_idle_paused = False
         self._focus_last_tick = time.monotonic()
         self._focus_completion_heart_pending = False
         self._dismiss_presence_bubble(user_initiated=False)
@@ -687,11 +775,24 @@ class FocusSessionMixin:
             self._focus_source_id = None
             return GLib.SOURCE_REMOVE
 
+        advance = self._advance_focus_clock(session)
+        self._present_focus_advance(session, advance)
+
+        if self._focus_window is not None:
+            self._focus_window.update_session(session)
+
+        if session.phase is FocusPhase.COMPLETE:
+            self._focus_source_id = None
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    def _advance_focus_clock(self, session: FocusSession) -> FocusAdvance:
+        """Settle elapsed wall time and award rewards without UI side effects."""
         now = time.monotonic()
-        previous = self._focus_last_tick or now
+        previous = self._focus_last_tick
         self._focus_last_tick = now
-        advance = session.advance(max(0.0, now - previous))
-        resumed_focus_visual = False
+        elapsed = 0.0 if previous is None else max(0.0, now - previous)
+        advance = session.advance(elapsed)
 
         if advance.xp_earned:
             award = getattr(self, "_award_bond", None)
@@ -700,12 +801,20 @@ class FocusSessionMixin:
                     advance.xp_earned,
                     persist=advance.completed,
                 )
+        return advance
+
+    def _present_focus_advance(
+        self,
+        session: FocusSession,
+        advance: FocusAdvance,
+    ) -> None:
+        """Apply animation and dialogue effects for an elapsed-time advance."""
+        resumed_focus_visual = False
 
         if advance.encouragements_due:
             self._show_focus_encouragement()
 
         if advance.transitions:
-            ## Logging mochi's focus session transitions
             self._logger.info("Focus session transitioned: %s", session.phase)
             if session.phase is FocusPhase.COMPLETE:
                 self._complete_focus_session()
@@ -725,27 +834,38 @@ class FocusSessionMixin:
         ):
             self._ensure_focus_visual()
 
-        if self._focus_window is not None:
-            self._focus_window.update_session(session)
-
-        if session.phase is FocusPhase.COMPLETE:
-            
-            
-            self._focus_source_id = None
-            return GLib.SOURCE_REMOVE
-        return GLib.SOURCE_CONTINUE
-
-
-
-
     def _toggle_focus_pause(self) -> None:
-
         session = self._focus_session
         if session is None or not session.active:
+            self._focus_idle_paused = False
             return
 
-        paused = session.toggle_paused()
+        advance = self._advance_focus_clock(session)
+        self._present_focus_advance(session, advance)
+        if not session.active:
+            self._focus_idle_paused = False
+            self._stop_focus_timer()
+            if self._focus_window is not None:
+                self._focus_window.update_session(session)
+            return
+
+        self._set_focus_paused(
+            session,
+            not session.paused,
+            idle_triggered=False,
+        )
+
+    def _set_focus_paused(
+        self,
+        session: FocusSession,
+        paused: bool,
+        *,
+        idle_triggered: bool,
+    ) -> None:
+        """Apply one pause transition after elapsed time has been settled."""
+        session.set_paused(paused)
         self._focus_last_tick = time.monotonic()
+        self._focus_idle_paused = bool(paused and idle_triggered)
         if paused:
             self._stop_focus_visual()
             self._focus_ambience.pause()
@@ -757,9 +877,13 @@ class FocusSessionMixin:
 
         if self._focus_window is not None:
             self._focus_window.update_session(session)
-        self._logger.info("Focus session %s", "paused" if paused else "resumed")
+        if idle_triggered:
+            self._logger.info("Focus session automatically paused for user inactivity")
+        else:
+            self._logger.info("Focus session %s", "paused" if paused else "resumed")
 
     def _cancel_focus_session(self) -> None:
+        self._focus_idle_paused = False
         session = self._focus_session
         if session is None:
             if self._focus_window is not None:
@@ -768,11 +892,18 @@ class FocusSessionMixin:
                 self._focus_window.present_setup(self._focus_plan)
             return
 
+        # Settle the interval since the most recent timer callback before the
+        # session is detached.  This preserves a just-completed minute and
+        # recognizes a session that actually finished before Stop was clicked.
+        advance = self._advance_focus_clock(session)
+        if advance.completed:
+            self._complete_focus_session()
         was_complete = session.phase is FocusPhase.COMPLETE
         self._stop_focus_timer()
         self._stop_focus_visual()
         self._focus_ambience.stop()
-        self._persist_focus_xp_if_needed()
+        if not was_complete:
+            self._persist_focus_xp_if_needed()
         self._focus_plan = session.plan
         self._focus_session = None
         self._focus_last_tick = None
@@ -790,6 +921,7 @@ class FocusSessionMixin:
             )
 
     def _complete_focus_session(self) -> None:
+        self._focus_idle_paused = False
         session = self._focus_session
         if session is None:
             return
@@ -804,7 +936,9 @@ class FocusSessionMixin:
         )
         self._stop_focus_visual()
         self._focus_ambience.stop()
-        self._persist_focus_xp_if_needed()
+        # The completion award was already submitted with persist=True by
+        # _advance_focus_clock. Do not immediately retry its save here if it
+        # failed; leave the Bond state dirty for a later flush.
         self._show_focus_line(FOCUS_COMPLETE_LINE)
 
         if (
@@ -899,7 +1033,11 @@ class FocusSessionMixin:
             return False
 
         if self.state.current is MochiState.SLEEPING:
-            self._wake_up()
+            # Merely opening the context menu must preserve explicit Sleep.
+            # Choosing Focus setup may wake Mochi so the authored setup
+            # presentation can begin.
+            if self._focus_setup_visible:
+                self._wake_up()
             return False
 
         if self.state.current is MochiState.WALKING:
@@ -935,7 +1073,7 @@ class FocusSessionMixin:
 
         if (
             self.state.current is not MochiState.IDLE
-            or self.player.animation is not ANIMATIONS["idle"]
+            or not self._is_idle_visual_active()
         ):
             return False
         if not self._transition_to(MochiState.IDLE_EMOTE):
@@ -953,7 +1091,11 @@ class FocusSessionMixin:
         # Let the short thinking intro finish before playing its authored exit.
 
     def _ensure_focus_visual(self) -> bool:
-        if not self._focus_should_work() or self._context_menu_open:
+        if (
+            not self._focus_should_work()
+            or self._context_menu_open
+            or getattr(self, "_press", None) is not None
+        ):
             return False
 
         if self.state.current is MochiState.SLEEPING:
@@ -992,7 +1134,7 @@ class FocusSessionMixin:
 
         if (
             self.state.current is not MochiState.IDLE
-            or self.player.animation is not ANIMATIONS["idle"]
+            or not self._is_idle_visual_active()
         ):
             return False
         if not self._transition_to(MochiState.COMPUTER):
@@ -1082,7 +1224,10 @@ class FocusSessionMixin:
                 pass
 
     def _persist_focus_xp_if_needed(self) -> None:
-        if getattr(self, "_bond_unsaved_xp", 0) <= 0:
+        if (
+            getattr(self, "_bond_unsaved_xp", 0) <= 0
+            and not getattr(self, "_bond_state_dirty", False)
+        ):
             return
         persist = getattr(self, "_persist_bond_state", None)
         if callable(persist):
@@ -1102,6 +1247,36 @@ class FocusSessionMixin:
             return self._ensure_focus_thinking_visual()
         return super()._maybe_resume_ambient_activity()
 
+    def _on_user_idle(self) -> None:
+        """Settle and pause active Focus time on the shared idle transition."""
+        super()._on_user_idle()
+        session = self._focus_session
+        if session is None or not session.active or session.paused:
+            return
+
+        advance = self._advance_focus_clock(session)
+        self._present_focus_advance(session, advance)
+        if not session.active:
+            self._focus_idle_paused = False
+            self._stop_focus_timer()
+            if self._focus_window is not None:
+                self._focus_window.update_session(session)
+            return
+
+        self._set_focus_paused(session, True, idle_triggered=True)
+
+    def _on_user_active(self) -> None:
+        """Resume only a Focus session whose pause was owned by user idle."""
+        super()._on_user_active()
+        if not self._focus_idle_paused:
+            return
+
+        session = self._focus_session
+        if session is None or not session.active or not session.paused:
+            self._focus_idle_paused = False
+            return
+        self._set_focus_paused(session, False, idle_triggered=False)
+
     def _begin_sleep(self) -> None:
         if self._focus_should_work():
             self._logger.debug("Automatic sleep deferred during focus session")
@@ -1111,28 +1286,42 @@ class FocusSessionMixin:
     def _toggle_sleep(self, *args, **kwargs) -> None:
         session = self._focus_session
         choosing_sleep = self.state.current is not MochiState.SLEEPING
+        if choosing_sleep:
+            self._focus_idle_paused = False
         if (
             choosing_sleep
             and session is not None
             and session.active
             and not session.paused
         ):
-            session.set_paused(True)
-            self._stop_focus_visual()
-            self._focus_ambience.pause()
+            advance = self._advance_focus_clock(session)
+            self._present_focus_advance(session, advance)
+            if session.active:
+                session.set_paused(True)
+                self._stop_focus_visual()
+                self._focus_ambience.pause()
+            else:
+                self._stop_focus_timer()
             if self._focus_window is not None:
                 self._focus_window.update_session(session)
         super()._toggle_sleep(*args, **kwargs)
 
     def shutdown_presence(self) -> None:
+        session = self._focus_session
+        if session is not None and session.active:
+            # The timer can be up to one tick behind wall time at shutdown.
+            # Settle rewards only; shutdown must not start new presentation.
+            self._advance_focus_clock(session)
         self._stop_focus_timer()
         self._focus_ambience.stop()
-        self._persist_focus_xp_if_needed()
+        # BondMeterMixin later in the application shutdown MRO owns the final
+        # persistence flush after Focus has released its windows and sources.
         if self._focus_window is not None:
             self._focus_window.destroy()
             self._focus_window = None
         self._focus_session = None
         self._focus_last_tick = None
+        self._focus_idle_paused = False
         self._focus_completion_heart_pending = False
         self._focus_setup_visible = False
         self._focus_context_menu_visible = False

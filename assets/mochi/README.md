@@ -27,6 +27,8 @@ Do not keep export ZIPs, spritesheets, Pixelorama source files, temporary render
 
 - `default` — canonical single-frame fallback.
 - `idle` — breathing/base idle loop.
+- `sad_idle` — optional sad-mood breathing loop selected through the mood
+  resolver while Mochi remains semantically idle.
 - `blink` — one-shot blink layered into idle behavior.
 - `walk`, `walk_left` — autonomous/manual walking loops.
 - `pickup` — transition into being held.
@@ -39,6 +41,11 @@ Do not keep export ZIPs, spritesheets, Pixelorama source files, temporary render
 - `bounce` — tactile click reaction.
 - `squish` — tactile click reaction.
 - `heart` — affectionate one-shot emote.
+- `wave` — friendly catalogue emote available from the starting bond level.
+- `coffee` — one-shot catalogue caffeine-break emote.
+- `this_is_fine` — rare one-shot catalogue emote unlocked at Bond Level 3.
+- `vs_code` — bond-gated coding-themed catalogue emote.
+- `mochi_exe` — high-bond legendary catalogue emote.
 - `fedora_intro`, `fedora_loop`, `fedora_outro` — hidden six-click Fedora-mode hat transition, held loop, and exit transition.
 
 ### Ambient / contextual activity
@@ -59,7 +66,7 @@ The runtime also derives helper animations such as `computer_intro`, `computer_t
 ## Adding a new emote
 
 1. Finish and clean the source animation first.
-2. Export only final 256 × 256 transparent PNG frames.
+2. Export only final transparent PNG runtime art. Use 256 × 256 frames by default; authored 64 × 64 cells or spritesheets are supported when their `source_cell_size` is declared in the manifest.
 3. Create one clearly named folder under `assets/mochi/`.
 4. Add the animation to `manifest.json` with the correct frame order, frame count, FPS, and loop behavior.
 5. Add/package the folder in `pyproject.toml` if it is a new directory.

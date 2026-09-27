@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from mochi.animation import Animation
 from mochi.buddy import Buddy
@@ -157,6 +157,38 @@ class BuddyDragReleaseTests(unittest.TestCase):
         buddy._transition_to.assert_called_once_with(MochiState.DROPPING)
         buddy._play_drag_settle.assert_called_once()
         buddy._config.save_position.assert_called_once_with((10, 20))
+
+
+class BuddyBlinkTests(unittest.TestCase):
+    def test_blink_owns_behavior_state_until_idle_visual_resumes(self) -> None:
+        player = SimpleNamespace(frame_index=0, elapsed_ms=25, play=Mock())
+        buddy = SimpleNamespace(
+            DOUBLE_BLINK_CHANCE=Buddy.DOUBLE_BLINK_CHANCE,
+            player=player,
+            _transition_to=Mock(return_value=True),
+            _idle_resume_position=None,
+            _current_animation="idle",
+            _active_animation=ANIMATIONS["idle"],
+            _pending_animation=None,
+            _logger=Mock(),
+            queue_draw=Mock(),
+            _animation_for=Mock(return_value=ANIMATIONS["idle"]),
+            _maybe_resume_ambient_activity=Mock(),
+        )
+
+        with patch("mochi.buddy.random.random", return_value=1.0):
+            Buddy._play_blink(buddy)
+
+        buddy._transition_to.assert_called_once_with(MochiState.BLINKING)
+        self.assertEqual(buddy._current_animation, "blink")
+
+        Buddy._resume_idle(buddy)
+
+        self.assertEqual(
+            buddy._transition_to.call_args_list,
+            [call(MochiState.BLINKING), call(MochiState.IDLE)],
+        )
+        self.assertEqual(buddy._current_animation, "idle")
 
 
 class BuddyContextMenuTests(unittest.TestCase):
@@ -343,6 +375,7 @@ class BuddyEmoteTests(unittest.TestCase):
             _tuning=SimpleNamespace(hover_heart_cooldown_seconds=2.0),
             _transition_to=Mock(return_value=True),
             _play_animation=Mock(),
+            _is_idle_visual_active=Mock(return_value=True),
         )
 
         with patch("mochi.ambient_activity.time.monotonic", return_value=10.0):
@@ -361,6 +394,7 @@ class BuddyEmoteTests(unittest.TestCase):
             _transition_to=Mock(return_value=True),
             _computer_idle_source_id=None,
             _play_animation=Mock(),
+            _is_idle_visual_active=Mock(return_value=True),
         )
 
         self.assertTrue(Buddy._start_computer_emote(buddy))
@@ -462,6 +496,7 @@ class BuddyTypingTests(unittest.TestCase):
             _computer_idle_source_id=None,
             _play_animation=Mock(),
             _logger=Mock(),
+            _is_idle_visual_active=Mock(return_value=True),
         )
 
         self.assertTrue(Buddy._start_typing_emote(buddy))
@@ -549,6 +584,7 @@ class BuddyWatchingTests(unittest.TestCase):
             _computer_idle_source_id=None,
             _play_animation=Mock(),
             _logger=Mock(),
+            _is_idle_visual_active=Mock(return_value=True),
         )
 
         self.assertTrue(Buddy._start_watching_emote(buddy))
@@ -633,6 +669,7 @@ class BuddySearchingTests(unittest.TestCase):
             _computer_idle_source_id=None,
             _play_animation=Mock(),
             _logger=Mock(),
+            _is_idle_visual_active=Mock(return_value=True),
         )
 
         self.assertTrue(Buddy._start_searching_emote(buddy))

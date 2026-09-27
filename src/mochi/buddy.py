@@ -17,6 +17,7 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 from mochi.animation import AnimationPlayer
+from mochi.autonomous_sleep import AutonomousSleepController
 from mochi.behavior import (
     ClickReactionBuffer,
     WalkMotion,
@@ -87,6 +88,7 @@ class Buddy(Gtk.DrawingArea):
         "stay-put": 224,
         "edge-roam": 268,
         "quick-start": 312,
+        "update": 356,
     }
     CONTEXT_MENU_BASE_SIZED_ROWS = frozenset(
         ("header", "separator", "status", "sleep", "close")
@@ -96,6 +98,13 @@ class Buddy(Gtk.DrawingArea):
     DOUBLE_BLINK_CHANCE = 0.075
     DOUBLE_BLINK_PAUSE_MS = (120, 250)
     HOVER_HEART_DELAY_MS = 280
+    # Keep autonomous activity calm enough that Mochi feels present without
+    # constantly moving around the desktop. Adding catalogue emotes changes
+    # variety, not the overall interruption rate.
+    IDLE_ACTION_INTERVAL_SECONDS = (20, 45)
+    IDLE_WALK_CHANCE = 0.10
+    IDLE_CATALOGUE_EMOTE_CHANCE = 0.20
+    IDLE_BREATHING_ENABLED = False
     PREVIEW_ANIMATIONS = (
         "default",
         "idle",
@@ -135,11 +144,13 @@ class Buddy(Gtk.DrawingArea):
         )
         self._menu_ui = BuddyMenuController(self)
         self._ambient_activity = AmbientActivityController(self)
+        self._autonomous_sleep = AutonomousSleepController(self)
         self.atlas = SpriteAtlas()
         self.player = AnimationPlayer(on_finished=self._finish_reaction)
-        self.player.play(ANIMATIONS["idle"])
+        initial_idle = self._animation_for("idle")
+        self.player.play(initial_idle)
         self._current_animation = "idle"
-        self._active_animation = ANIMATIONS["idle"]
+        self._active_animation = initial_idle
         self._pending_animation: str | None = None
         self._click_reactions = ClickReactionBuffer()
         self._idle_resume_position: tuple[int, int] | None = None
@@ -261,6 +272,7 @@ class Buddy(Gtk.DrawingArea):
             self._schedule_idle_action()
             self._schedule_blink()
             self._schedule_computer_idle_emote()
+            self._autonomous_sleep.start()
 
 
 
@@ -328,6 +340,9 @@ class Buddy(Gtk.DrawingArea):
 
     def _test_computer_emote(self, *args, **kwargs):
         return _menu_ui_for(self)._test_computer_emote(*args, **kwargs)
+
+    def _test_autonomous_nap(self, *args, **kwargs):
+        return _menu_ui_for(self)._test_autonomous_nap(*args, **kwargs)
 
     def _reset_position(self, *args, **kwargs):
         return _menu_ui_for(self)._reset_position(*args, **kwargs)
@@ -457,7 +472,7 @@ class Buddy(Gtk.DrawingArea):
         if (
             self.state.current is not MochiState.IDLE
             or self._context_menu_open
-            or self.player.animation is not ANIMATIONS["idle"]
+            or not self._is_idle_visual_active()
         ):
             return False
         if (
@@ -476,7 +491,7 @@ class Buddy(Gtk.DrawingArea):
         if (
             self.state.current is not MochiState.IDLE
             or self._context_menu_open
-            or self.player.animation is not ANIMATIONS["idle"]
+            or not self._is_idle_visual_active()
         ):
             return False
         if not self._transition_to(MochiState.COMPUTER):
@@ -759,17 +774,57 @@ class Buddy(Gtk.DrawingArea):
             ):
                 self._schedule_computer_idle_emote()
 
+    def _animation_name_for_mood(self, name: str) -> str:
+        """Resolve a semantic animation name to an installed mood variant."""
+        resolver = getattr(self, "_resolve_mood_animation_name", None)
+        if callable(resolver):
+            resolved = resolver(name, ANIMATIONS)
+            if resolved in ANIMATIONS:
+                return resolved
+        return name
+
+    def _animation_for(self, name: str):
+        animation = ANIMATIONS[self._animation_name_for_mood(name)]
+        if name == "idle" and not self.IDLE_BREATHING_ENABLED:
+            return replace(
+                animation,
+                frames=(animation.frames[0],),
+                frame_duration_ms=1_000,
+                looping=True,
+            )
+        return animation
+
+    def _is_idle_visual_active(self) -> bool:
+        """True when Mochi is semantically in the standing-idle presentation."""
+        return (
+            self.state.current is MochiState.IDLE
+            and self._current_animation == "idle"
+            and self.player.animation is not None
+        )
+
+    def _walk_speed_multiplier(self) -> float:
+        provider = getattr(self, "_mood_walk_speed_multiplier", None)
+        if not callable(provider):
+            return 1.0
+        try:
+            return max(0.1, float(provider()))
+        except (TypeError, ValueError):
+            return 1.0
+
     def _play_animation(self, name: str, after: str | None = None) -> None:
         previous = self._current_animation
-        if name == "blink" and self.player.animation is ANIMATIONS["idle"]:
+        if name == "blink" and self._is_idle_visual_active():
             self._idle_resume_position = (
                 self.player.frame_index,
                 self.player.elapsed_ms,
             )
         elif name != "blink":
             self._idle_resume_position = None
+
+        # Keep _current_animation semantic ("idle", "walk", "walk_left") even
+        # when the player renders a mood-specific asset such as "sad_idle".
         self._current_animation = name
-        animation = ANIMATIONS[name]
+        animation = self._animation_for(name)
         if name == "pickup":
             animation = replace(
                 animation,
@@ -778,7 +833,15 @@ class Buddy(Gtk.DrawingArea):
         self._active_animation = animation
         self._pending_animation = after if after is not None else animation.next_state
         self.player.play(animation)
-        self._logger.debug("Animation: %s -> %s", previous, name)
+        if animation.name == name:
+            self._logger.debug("Animation: %s -> %s", previous, name)
+        else:
+            self._logger.debug(
+                "Animation: %s -> %s (mood variant: %s)",
+                previous,
+                name,
+                animation.name,
+            )
         self.queue_draw()
 
     def _begin_pickup(self) -> bool:
@@ -790,17 +853,24 @@ class Buddy(Gtk.DrawingArea):
         return True
 
     def _resume_idle(self) -> None:
+        self._transition_to(MochiState.IDLE)
         frame_index, elapsed_ms = self._idle_resume_position or (0, 0)
         self._idle_resume_position = None
         previous = self._current_animation
+        idle_animation = self._animation_for("idle")
+        frame_index = min(frame_index, len(idle_animation.frames) - 1)
         self._current_animation = "idle"
-        self._active_animation = ANIMATIONS["idle"]
+        self._active_animation = idle_animation
         self.player.play(
-            ANIMATIONS["idle"],
+            idle_animation,
             frame_index=frame_index,
             elapsed_ms=elapsed_ms,
         )
-        self._logger.debug("Animation: %s -> idle (resumed)", previous)
+        self._logger.debug(
+            "Animation: %s -> idle (resumed%s)",
+            previous,
+            "" if idle_animation.name == "idle" else f": {idle_animation.name}",
+        )
         self.queue_draw()
         self._maybe_resume_ambient_activity()
 
@@ -818,6 +888,12 @@ class Buddy(Gtk.DrawingArea):
     def _wake_up(self) -> None:
         if not can_begin_wake(self.state.current):
             return
+        try:
+            autonomous_sleep = object.__getattribute__(self, "_autonomous_sleep")
+        except AttributeError:
+            autonomous_sleep = None
+        if autonomous_sleep is not None and autonomous_sleep.owns_sleep:
+            autonomous_sleep.note_external_wake()
         self._transition_to(MochiState.WAKING)
         self._user_idle = False
         self._mark_interaction()
@@ -834,7 +910,8 @@ class Buddy(Gtk.DrawingArea):
     def _schedule_idle_action(self) -> None:
         if self._idle_action_source_id is None:
             self._idle_action_source_id = GLib.timeout_add_seconds(
-                random.randint(5, 15), self._choose_idle_action
+                random.randint(*self.IDLE_ACTION_INTERVAL_SECONDS),
+                self._choose_idle_action,
             )
 
     def _schedule_blink(self) -> None:
@@ -873,7 +950,7 @@ class Buddy(Gtk.DrawingArea):
             if (
                 self.state.current is MochiState.IDLE
                 and not self._context_menu_open
-                and self.player.animation is ANIMATIONS["idle"]
+                and self._is_idle_visual_active()
             ):
                 self._play_blink()
             return GLib.SOURCE_REMOVE
@@ -881,6 +958,8 @@ class Buddy(Gtk.DrawingArea):
             self._schedule_blink()
 
     def _play_blink(self) -> None:
+        if not self._transition_to(MochiState.BLINKING):
+            return
         self._idle_resume_position = (
             self.player.frame_index,
             self.player.elapsed_ms,
@@ -904,7 +983,36 @@ class Buddy(Gtk.DrawingArea):
         self._logger.debug("Animation: %s -> blink", previous)
         self.queue_draw()
 
+    def _play_autonomous_catalogue_emote(self, name: str) -> bool:
+        """Play one unlocked catalogue emote as a finite idle reaction."""
+
+        animation = ANIMATIONS.get(name)
+        if animation is None:
+            self._logger.warning("Catalogue emote animation is missing: %s", name)
+            return False
+        if not self._transition_to(MochiState.IDLE_EMOTE):
+            return False
+
+        # Some animations (notably Dance) are looping in their contextual use.
+        # Autonomous catalogue appearances must always finish and yield back to
+        # idle, so normalize only this playback instance rather than changing
+        # the authored animation globally.
+        autonomous = replace(animation, looping=False, next_state="idle")
+        previous = self._current_animation
+        self._current_animation = name
+        self._active_animation = autonomous
+        self._pending_animation = "idle"
+        self.player.play(autonomous)
+        self._logger.debug("Animation: %s -> %s (catalogue idle)", previous, name)
+        self.queue_draw()
+        return True
+
     def _choose_idle_action(self) -> bool:
+        return self._choose_idle_action_with_walk(allow_walk=True)
+
+    def _choose_idle_action_with_walk(self, *, allow_walk: bool) -> bool:
+        """Run one idle opportunity with stable walk/emote category weights."""
+
         self._idle_action_source_id = None
         try:
             if self.state.current is not MochiState.IDLE or self._context_menu_open:
@@ -917,18 +1025,22 @@ class Buddy(Gtk.DrawingArea):
             # Automatic sleep is driven by the GNOME Shell presence monitor.
             # Local Mochi interaction timestamps are not a proxy for whether the
             # user is actually present at the computer.
-            unlocked_idle = tuple(
-                getattr(self, "_available_idle_emote_animations", lambda: ())()
+            unlocked_emotes = tuple(
+                getattr(
+                    self,
+                    "_available_catalogue_emote_animations",
+                    lambda: (),
+                )()
             )
-            action = random.choice(("walk", "squish", None, None, *unlocked_idle))
-            if action == "squish":
-                self._transition_to(MochiState.SQUISHING)
-                self._play_animation("squish")
-            elif action == "walk":
+            roll = random.random()
+            if allow_walk and roll < self.IDLE_WALK_CHANCE:
                 self._start_walk()
-            elif action in unlocked_idle:
-                if self._transition_to(MochiState.IDLE_EMOTE):
-                    self._play_animation(action)
+                return GLib.SOURCE_REMOVE
+
+            emote_start = self.IDLE_WALK_CHANCE if allow_walk else 0.0
+            emote_end = emote_start + self.IDLE_CATALOGUE_EMOTE_CHANCE
+            if unlocked_emotes and emote_start <= roll < emote_end:
+                self._play_autonomous_catalogue_emote(random.choice(unlocked_emotes))
             return GLib.SOURCE_REMOVE
         finally:
             self._schedule_idle_action()
@@ -944,21 +1056,27 @@ class Buddy(Gtk.DrawingArea):
         actual_distance = math.hypot(target.x - origin.x, target.y - origin.y)
         if actual_distance < WalkMotion.MIN_DISTANCE:
             return
-        cycle_duration_ms = (
-            len(ANIMATIONS["walk"].frames)
-            * ANIMATIONS["walk"].frame_duration_ms
+
+        walk_name = choose_walk_animation(
+            (origin.x, origin.y),
+            (target.x, target.y),
+        )
+        walk_animation = self._animation_for(walk_name)
+        cycle_duration_ms = sum(
+            frame.duration_ms or walk_animation.frame_duration_ms
+            for frame in walk_animation.frames
         )
         self._walk_motion = WalkMotion(
             origin=(origin.x, origin.y),
             target=(target.x, target.y),
             cycle_duration_ms=cycle_duration_ms,
-            speed_px_per_second=self.WALK_SPEED_PX_PER_SECOND,
+            speed_px_per_second=(
+                self.WALK_SPEED_PX_PER_SECOND * self._walk_speed_multiplier()
+            ),
         )
         self._walk_elapsed_ms = 0
         self._transition_to(MochiState.WALKING)
-        self._play_animation(
-            choose_walk_animation((origin.x, origin.y), (target.x, target.y))
-        )
+        self._play_animation(walk_name)
 
     def _advance_walk(self, elapsed_ms: int | None = None) -> None:
         if self._walk_motion is None:
